@@ -1,0 +1,527 @@
+```{r}
+library(survival)
+library(readr)
+library(ggplot2)
+library(survminer)
+library(cluster)
+library(corrplot)
+library(boot)
+library(parallel)
+library(dplyr)
+library(FactoMineR)
+library(broom)
+library(tidyr)
+library(knitr)
+library(DT)
+```
+
+# Loading dataset
+```{r}
+data_hcc <- read.csv("/Users/neyandeng/Desktop/2025WINTER/BIOSTAT699/Project 2/Radiation Therapy Data/data_hcc.csv", stringsAsFactors = FALSE)
+data_path <- "/Users/neyandeng/Desktop/2025WINTER/BIOSTAT699/Project 2/Radiation Therapy Data/"
+
+# 获取 7 个 alpha/beta 文件
+abratio_files <- c("abratio_1.csv", "abratio_2.csv", "abratio_3.csv", "abratio_5.csv", "abratio_10.csv", "abratio_20.csv", "abratio_100.csv")
+
+# 初始化存储 AIC/BIC 结果的 data frame
+model_results <- data.frame(alpha_beta = numeric(), AIC = numeric(), BIC = numeric())
+
+# 遍历每个 abratio_ 文件
+for (file in abratio_files) {
+  # 读取当前 α/β 数据
+  abratio_data <- read.csv(paste0(data_path, file), stringsAsFactors = FALSE)
+  # 提取 α/β 值
+  alpha_beta <- as.numeric(gsub("abratio_|\\.csv", "", file))
+  # 合并 `data_hcc.csv` 和当前 `abratio_#.csv`
+  merged_data <- cbind(data_hcc, abratio_data[, -c(1, 2)])  # 移除重复的 ID 和 tumorID
+  # 计算 Fraction Dose（每次治疗剂量）
+  merged_data$fraction_dose <- merged_data$total_dose / merged_data$total_fx
+  # 计算 BED
+  merged_data$BED <- merged_data$total_dose * (1 + (merged_data$fraction_dose / alpha_beta))
+  #merged_data$event <- as.factor(merged_data$event)
+  merged_data$hospital <- case_when(
+  grepl("^PM", merged_data$ID) ~ "Toronto",
+  grepl("^RO", merged_data$ID) ~ "Michigan",
+  grepl("^R0", merged_data$ID) ~ "Michigan",
+  TRUE ~ NA_character_  # 其他情况设为 NA
+)
+  merged_data$hospital <- as.factor(merged_data$hospital)
+  merged_data$BED_group <- cut(merged_data$BED, 
+                             breaks = quantile(merged_data$BED, probs = c(0, 0.33, 0.66, 1), na.rm = TRUE), 
+                             labels = c("Low", "Medium", "High"))
+  merged_data$fx_group <- cut(merged_data$total_fx, 
+                            breaks = c(0, 5, Inf),  
+                            #labels = c("≤3 fractions", "3-5 fractions", "5-6 fractions", ">6 fractions"), 
+                            labels = c("≤5 fractions",">5 fractions"),
+                            right = TRUE)  # 右闭区间 (包含右端点)
+  
+  # 运行 Cox 生存回归
+  cox_model <- coxph(Surv(time, event) ~ BED + GTV + elapsed_time + total_dose, data = merged_data)
+  c_index <- summary(cox_model)$concordance[1]
+  # 存储 AIC 和 BIC
+  model_results <- rbind(model_results, data.frame(alpha_beta = alpha_beta, AIC = AIC(cox_model), BIC = BIC(cox_model), C_index = c_index))
+}
+
+# 输出 AIC/BIC 结果
+print(model_results)
+
+# 找到 AIC 和 BIC 最小的 α/β
+best_alpha_beta <- model_results[which.min(model_results$AIC), "alpha_beta"]
+print(paste("Best α/β based on AIC:", best_alpha_beta))
+best_alpha_beta_bic <- model_results[which.min(model_results$BIC), "alpha_beta"]
+print(paste("Best α/β based on BIC:", best_alpha_beta_bic))
+best_alpha_beta_cindex <- model_results[which.max(model_results$C_index), "alpha_beta"]
+print(paste("Best α/β based on C-index:", best_alpha_beta_cindex))
+```
+
+```{r}
+# 定义数据路径
+data_path <- "/Users/neyandeng/Desktop/2025WINTER/BIOSTAT699/Project 2/Radiation Therapy Data/"
+
+# 获取 7 个 alpha/beta 文件
+abratio_files <- c("abratio_1.csv", "abratio_2.csv", "abratio_3.csv", 
+                   "abratio_5.csv", "abratio_10.csv", "abratio_20.csv", "abratio_100.csv")
+
+# 提取 alpha/beta 值
+alpha_beta_values <- as.numeric(gsub("abratio_|\\.csv", "", abratio_files))
+
+# 定义 DVH 变量
+dvh_variables <- c("min_lqdose", "X5th_dose", "X10th_dose", "X15th_dose", 
+                   "X20th_dose", "X25th_dose", "X30th_dose", "X35th_dose", "X40th_dose", 
+                   "X45th_dose", "X50th_dose", "X55th_dose", "X60th_dose", "X65th_dose", 
+                   "X70th_dose", "X75th_dose", "X80th_dose", "X85th_dose", "X90th_dose", 
+                   "X95th_dose", "max_lqdose")
+
+# 读取 data_hcc
+data_hcc <- read.csv(file.path(data_path, "data_hcc.csv"), stringsAsFactors = FALSE)
+
+# 初始化存储 p-value 的数据框
+p_value_results <- data.frame()
+aic_results <- data.frame()
+# 遍历每个 alpha/beta 数据集
+for (i in seq_along(abratio_files)) {
+  # 读取当前 α/β 数据
+  abratio_data <- read.csv(file.path(data_path, abratio_files[i]), stringsAsFactors = FALSE)
+  
+  # 合并数据
+merged_data <- cbind(data_hcc, abratio_data[, -c(1, 2)]) 
+  
+  # 遍历每个 DVH 变量并运行 Cox 模型
+  for (dvh in dvh_variables) {
+    # 确保变量不存在 NA 值
+    temp_data <- merged_data %>% select(time, event, all_of(dvh)) %>% na.omit()
+    
+    # 生成 Cox 回归公式
+    formula <- as.formula(paste("Surv(time, event) ~", dvh))
+    
+    # 运行 Cox 回归
+    cox_model <- coxph(formula, data = temp_data)
+    
+    # 提取 p-value
+    p_value <- tidy(cox_model)$p.value[1]
+    aic <- AIC(cox_model)
+    
+    # 存储结果
+    p_value_results <- rbind(p_value_results, 
+                             data.frame(alpha_beta = alpha_beta_values[i], 
+                                        DVH_Variable = dvh, 
+                                        p_value = p_value))
+    aic_results <- rbind(aic_results, 
+                             data.frame(alpha_beta = alpha_beta_values[i], 
+                                        DVH_Variable = dvh, 
+                                        AIC = aic))
+  }
+}
+
+# 显示结果
+datatable(p_value_results, options = list(pageLength = 10))
+print(p_value_results)
+```
+
+```{r}
+# 将数据转换为 7 列 * 21 行的格式
+p_value_wide <- p_value_results %>%
+  pivot_wider(names_from = alpha_beta, values_from = p_value)
+
+aic_wide <- aic_results %>%
+  pivot_wider(names_from = alpha_beta, values_from = AIC)
+# 打印表格
+print(p_value_wide)
+print(aic_wide)
+
+# 以更好格式展示表格
+kable(p_value_wide, caption = "P-values for Different DVH Variables in Cox Models")
+```
+
+```{r}
+# 重新转换为 long format 以用于 heatmap
+p_value_long <- p_value_wide %>%
+  pivot_longer(cols = -DVH_Variable, names_to = "alpha_beta", values_to = "p_value")
+
+# 确保因子顺序与原始表格一致
+p_value_long$DVH_Variable <- factor(p_value_long$DVH_Variable, levels = rev(unique(p_value_results$DVH_Variable)))
+p_value_long$alpha_beta <- factor(p_value_long$alpha_beta, levels = unique(p_value_results$alpha_beta))
+
+ggplot(p_value_long, aes(x = alpha_beta, y = DVH_Variable, fill = p_value)) +
+  geom_tile() +
+  scale_fill_gradient(low = "#B7686c", high = "#72A6C5", name = "P-value") +
+  labs(title = "P-value Heatmap for Different DVH Variables in Cox Models",
+       x = "Alpha/Beta Ratio",
+       y = "DVH Variable") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# 计算按照 ratio 计算的 AIC 均值（按列计算，跳过第一列 DVH_Variable）
+mean_aic_by_ratio <- colMeans(aic_wide[, -1], na.rm = TRUE)
+
+# 计算按照 DVH 计算的 AIC 均值（按行计算，跳过第一列 DVH_Variable）
+mean_aic_by_dvh <- rowMeans(aic_wide[, -1], na.rm = TRUE)
+
+# 将结果转换为数据框以便查看
+mean_aic_by_ratio_df <- data.frame(Ratio = names(mean_aic_by_ratio), Mean_AIC = mean_aic_by_ratio)
+mean_aic_by_dvh_df <- data.frame(DVH_Variable = aic_wide[, 1], Mean_AIC = mean_aic_by_dvh)
+
+# 打印结果
+print(mean_aic_by_ratio_df)
+print(mean_aic_by_dvh_df)
+```
+
+
+# Merge Dataset
+```{r}
+# 读取数据
+data_hcc <- read.csv("/Users/neyandeng/Desktop/2025WINTER/BIOSTAT699/Project 2/Radiation Therapy Data/data_hcc.csv", stringsAsFactors = FALSE)
+data_abratio <- read.csv("/Users/neyandeng/Desktop/2025WINTER/BIOSTAT699/Project 2/Radiation Therapy Data/abratio_20.csv", stringsAsFactors = FALSE)
+
+# 合并数据
+merged_data <- cbind(data_hcc, abratio_data[, -c(1, 2)])  # 移除重复的 ID 和 tumorID
+
+# 确保 event 变量是 0/1 数值型
+merged_data$event <- as.numeric(as.character(merged_data$event))
+
+# 计算 Fraction Dose（每次治疗剂量）
+merged_data$fraction_dose <- merged_data$total_dose / merged_data$total_fx
+
+# 计算 BED 和 EQD2（α/β = 10）
+best_alpha_beta <- 20
+# 计算 BED
+merged_data$BED <- merged_data$total_dose * (1 + (merged_data$fraction_dose / best_alpha_beta))
+# 正确计算 EQD2
+merged_data$EQD2 <- merged_data$BED / (1 + (2 / best_alpha_beta))
+
+  merged_data$hospital <- case_when(
+  grepl("^PM", merged_data$ID) ~ "Toronto",
+  grepl("^RO", merged_data$ID) ~ "Michigan",
+  grepl("^R0", merged_data$ID) ~ "Michigan",
+  TRUE ~ NA_character_  # 其他情况设为 NA
+)
+merged_data$hospital <- as.factor(merged_data$hospital)
+
+#tumor_counts <- merged_data %>%
+#  group_by(ID) %>%
+#  summarise(NumTumor = n()) %>%
+#  ungroup()
+
+# 将计算出的 NumTumor 变量合并回原数据集
+#merged_data <- merged_data %>%
+#  left_join(tumor_counts, by = "ID")
+
+# 查看 BED/EQD2 计算结果
+head(merged_data[, c("tumorID", "BED", "EQD2")])
+```
+
+# Ploting histogram for each variables
+```{r}
+# 选择需要绘制直方图的变量
+variables <- c("BED", "EQD2", "GTV", "elapsed_time", "min_lqdose", "max_lqdose", "X5th_dose")
+
+# 逐个绘制直方图
+hist(merged_data$elapsed_time, main = "Histogram of Elapsed Time", xlab = "Elapsed Time", col = "lightblue", border = "black")
+
+hist(merged_data$BED, main = "Histogram of BED", xlab = "BED", col = "lightblue", border = "black")
+
+hist(merged_data$EQD2, main = "Histogram of EQD2", xlab = "EQD2", col = "lightblue", border = "black")
+
+hist(merged_data$GTV, main = "Histogram of GTV", xlab = "GTV", col = "lightblue", border = "black")
+
+hist(merged_data$min_lqdose, main = "Histogram of min_lqdose", xlab = "min_lqdose", col = "lightblue", border = "black")
+
+hist(merged_data$max_lqdose, main = "Histogram of X5th_dose", xlab = "X5th_dose", col = "lightblue", border = "black")
+```
+
+# Log transformation
+```{r}
+merged_data$log_GTV <- log(merged_data$GTV + 0.1)
+merged_data$log_elapsed_time <- log(merged_data$elapsed_time + 1)
+
+hist(merged_data$log_GTV, main = "Histogram of log GTV", xlab = "log GTV", col = "lightblue", border = "black")
+
+hist(merged_data$log_elapsed_time, main = "Histogram of log elapsed time", xlab = "log elapsed time", col = "lightblue", border = "black")
+```
+
+
+# Carme's Heatmap
+```{r}
+# 计算相关性矩阵
+names = c("total dose", "total fraction", "BED", "log tumor volume", "log treatment time", "5th DVH")
+cor_matrix <- cor(merged_data[, c("total_dose", "total_fx", "BED", "log_GTV", "log_elapsed_time", "X5th_dose")], use = "pairwise.complete.obs")
+# 绘制热图
+colnames(cor_matrix) <- names
+rownames(cor_matrix) <- names
+corrplot(cor_matrix, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45,  # 变量名称设置
+         addCoef.col = "black",  # 添加相关系数数值
+         number.cex = 0.8)
+```
+
+```{r}
+library(factoextra)
+names = c("total dose", "total fraction", "BED", "log tumor volume", "log treatment time", "5th DVH")
+pca_result <- PCA(merged_data[, c("total_dose", "total_fx", "BED", "log_GTV", "log_elapsed_time", "X5th_dose")], scale.unit = TRUE)
+rownames(pca_result$var$coord) <- names
+fviz_pca_var(pca_result, repel = TRUE) +
+  theme_minimal() +
+  labs(title = "PCA of Radiation Treatment Variables")
+```
+
+```{r}
+
+# 拟合线性回归模型（Cox 模型不能直接计算 VIF，需要先用线性回归）
+#lm_model <- lm(time ~  total_fx + BED  + GTV  + elapsed_time , data = merged_data)
+#cox_model <- coxph(Surv(time, event) ~ BED  + log_GTV + log_elapsed_time + total_fx, data = merged_data)
+#vif(cox_model)
+```
+
+# Calculate KM survival curve
+```{r}
+# 计算 Kaplan-Meier 生存曲线
+km_fit <- survfit(Surv(time, event) ~ 1, data = data_hcc)
+
+# 绘制 KM 曲线
+ggsurvplot(km_fit, data = data_hcc, 
+           pval = TRUE, conf.int = TRUE,
+           #risk.table = TRUE, # 显示风险表
+           title = "Kaplan-Meier Survival Curve for HCC Patients",
+           xlab = "Time (Days)", ylab = "Survival Probability", xlim = c(0, 3800), ylim = c(0.25, 1))
+
+ggsurvplot(km_fit, data = data_hcc, 
+           risk.table = TRUE, 
+           tables.theme = theme_cleantable(),
+           title = "Number at Risk",
+           xlab = "Time (Days)",
+           ggtheme = theme(plot.title = element_text(size = 13)),
+           risk.table.height = 0.2)  # 调整 risk table 的高度
+
+```
+
+# KM Survival curve grouped by X5th_dose
+```{r}
+# 以 BED 三等分分组（Low, Medium, High）
+merged_data$X5th_dose_group <- cut(merged_data$X5th_dose, 
+                             breaks = quantile(merged_data$X5th_dose, probs = c(0, 0.33, 0.66, 1), na.rm = TRUE), 
+                             labels = c("Low", "Medium", "High"))
+
+# 计算 Kaplan-Meier 生存曲线（按 X5th_dose 分组）
+km_fit_X5th_dose <- survfit(Surv(time, event) ~ X5th_dose_group, data = merged_data)
+
+# 画 KM 曲线
+ggsurvplot(km_fit_X5th_dose, data = merged_data, 
+           pval = TRUE, conf.int = TRUE,
+           title = "Kaplan-Meier Survival by 5th DVH Dose Group",
+           xlab = "Time (Days)", ylab = "Survival Probability"
+           )
+
+ggsurvplot(km_fit_X5th_dose, data = merged_data, 
+           pval = TRUE, conf.int = TRUE,
+           title = "Kaplan-Meier Survival by 5th DVH Dose Group",
+           xlab = "Time (Days)", ylab = "Survival Probability",
+           ggtheme = theme(plot.title = element_text(size = 13)),
+           risk.table = TRUE, risk.table.height=0.3)
+```
+
+```{r}
+# 以 BED 三等分分组（Low, Medium, High）
+merged_data$BED_group <- cut(merged_data$BED, 
+                             breaks = quantile(merged_data$BED, probs = c(0, 0.33, 0.66, 1), na.rm = TRUE), 
+                             labels = c("Low", "Medium", "High"))
+
+# 计算 Kaplan-Meier 生存曲线（按 BED 分组）
+km_fit_bed <- survfit(Surv(time, event) ~ BED_group, data = merged_data)
+
+# 画 KM 曲线
+ggsurvplot(km_fit_bed, data = merged_data, 
+           pval = TRUE, conf.int = TRUE,
+           title = "Kaplan-Meier Survival by BED Group",
+           xlab = "Time (Days)", ylab = "Survival Probability"
+           )
+
+ggsurvplot(km_fit_bed, data = merged_data, 
+           pval = TRUE, conf.int = TRUE,
+           title = "Kaplan-Meier Survival by BED Group",
+           xlab = "Time (Days)", ylab = "Survival Probability",
+           ggtheme = theme(plot.title = element_text(size = 13)),
+           risk.table = TRUE, risk.table.height=0.3)
+```
+
+
+# KM-curve by fraction
+```{r}
+# 根据 total_fx 进行分组
+
+merged_data$fx_group <- cut(merged_data$total_fx, 
+                            breaks = c(0, 5, Inf),  
+                            #labels = c("≤3 fractions", "3-5 fractions", "5-6 fractions", ">6 fractions"), 
+                            labels = c("≤5 fractions",">5 fractions"),
+                            right = TRUE)  # 右闭区间 (包含右端点)
+
+# 确保 event 变量是数值型
+merged_data$event <- as.numeric(as.character(merged_data$event))
+
+# 计算 Kaplan-Meier 生存曲线（按 fractionation 组）
+km_fit_fx <- survfit(Surv(time, event) ~ fx_group, data = merged_data)
+
+# 画 Kaplan-Meier 生存曲线
+ggsurvplot(km_fit_fx, data = merged_data, 
+           pval = TRUE, conf.int = TRUE,  # 显示 p-value 和置信区间
+           title = "Kaplan-Meier Survival by Fractionation",
+           xlab = "Time (Days)", ylab = "Survival Probability")
+
+ggsurvplot(km_fit_fx, data = merged_data, 
+           pval = TRUE, conf.int = TRUE,  # 显示 p-value 和置信区间
+           title = "Kaplan-Meier Survival by Fractionation",
+           xlab = "Time (Days)", ylab = "Survival Probability",
+           ggtheme = theme(plot.title = element_text(size = 13)),
+           risk.table = TRUE, risk.table.height=0.3)
+```
+# KM curve grouped by elapsed time
+```{r}
+elapsed_breaks <- quantile(merged_data$elapsed_time, probs = c(0, 0.33, 0.66, 1), na.rm = TRUE)
+
+merged_data$elapsed_group <- cut(merged_data$elapsed_time, 
+                                 breaks = unique(elapsed_breaks), 
+                                 labels = c("short", "median", "long"), 
+                                 include.lowest = TRUE) 
+
+km_fit_elapsed <- survfit(Surv(time, event) ~ elapsed_group, data = merged_data)
+
+ggsurvplot(km_fit_elapsed, data = merged_data, 
+           pval = TRUE, conf.int = TRUE, 
+           title = "Kaplan-Meier Survival by Elapsed Treatment Duration Time",
+           xlab = "Time (Days)", ylab = "Survival Probability")
+
+ggsurvplot(km_fit_elapsed, data = merged_data, 
+           pval = TRUE, conf.int = TRUE, 
+           title = "Kaplan-Meier Survival by Elapsed Treatment Duration Time",
+           xlab = "Time (Days)", ylab = "Survival Probability",
+           ggtheme = theme(plot.title = element_text(size = 13)),
+           risk.table = TRUE, 
+           risk.table.height = 0.35)
+```
+
+
+```{r}
+km_fit_hospital <- survfit(Surv(time, event) ~ hospital, data = merged_data)
+ggsurvplot(km_fit_hospital, data = merged_data, 
+           pval = TRUE, conf.int = TRUE, 
+           title = "Kaplan-Meier Survival by Hospital",
+           xlab = "Time (Days)", ylab = "Survival Probability")
+
+ggsurvplot(km_fit_hospital, data = merged_data, 
+           pval = TRUE, conf.int = TRUE, 
+           title = "Kaplan-Meier Survival by Hospital",
+           xlab = "Time (Days)", ylab = "Survival Probability",
+           risk.table = TRUE, 
+           risk.table.height = 0.35)
+```
+
+
+
+```{r}
+# 运行 Cox 生存回归模型
+cox_model1 <- coxph(Surv(time, event) ~ BED + log_GTV + log_elapsed_time + fx_group + hospital, data = merged_data)
+# 查看模型结果
+summary(cox_model1)
+# 画森林图，查看 BED 的影响
+ggforest(cox_model1, data = merged_data)
+```
+
+```{r}
+cox_model2 <- coxph(Surv(time, event) ~ BED_group + log_GTV + log_elapsed_time + fx_group + hospital, data = merged_data)
+# 查看模型结果
+summary(cox_model2)
+# 画森林图，查看 BED 的影响
+ggforest(cox_model2, data = merged_data)
+```
+
+```{r}
+cox_model3 <- coxph(Surv(time, event) ~ X5th_dose + log_GTV + log_elapsed_time + fx_group + hospital, data = merged_data)
+# 查看模型结果
+summary(cox_model3)
+# 画森林图，查看 BED 的影响
+ggforest(cox_model3, data = merged_data)
+```
+
+```{r}
+cox_model4 <- coxph(Surv(time, event) ~ X5th_dose_group + log_GTV + log_elapsed_time + fx_group + hospital, data = merged_data)
+# 查看模型结果
+summary(cox_model4)
+# 画森林图，查看 BED 的影响
+ggforest(cox_model4, data = merged_data)
+```
+
+
+```{r}
+# 假设你已经建立了 Cox 模型
+# 测试 PH 假设
+ph_test <- cox.zph(cox_model4)
+print(ph_test)
+# 绘制 Schoenfeld 残差图
+plot(ph_test)
+```
+
+
+```{r}
+# 逐步变量选择，优化模型
+stepwise_cox <- step(cox_model4, direction = "both")
+summary(stepwise_cox)
+```
+
+
+```{r}
+library(survival)
+
+# 逐步变量选择，优化模型
+stepwise_cox <- step(cox_model4, direction = "both")
+summary(stepwise_cox)  # 这个输出不会包含 C-index
+
+# 计算 C-index
+c_index <- concordance(stepwise_cox)$concordance
+print(paste("C-index:", round(c_index, 3)))
+
+```
+
+
+
+
+```{r}
+n_cores <- detectCores() - 1
+
+cox_bootstrap <- function(data, indices) {
+  d <- data[indices, ] 
+  fit <- coxph(Surv(time, event) ~ X5th_dose_group + log_GTV + log_elapsed_time + fx_group + hospital , data = d)
+  return(coef(fit))
+}
+boot_results <- boot(data = merged_data, statistic = cox_bootstrap, 
+                     R = 1000, parallel = "multicore", ncpus = n_cores, simple = T)
+boot.ci(boot_results, type = "bca")
+
+# 获取所有变量的置信区间
+ci_results <- lapply(1:ncol(boot_results$t), function(i) {
+  boot.ci(boot_results, type = "bca", index = i)
+})
+names(ci_results) <- colnames(boot_results$t)  # 给结果命名
+ci_results
+```
+
